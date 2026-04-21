@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Reproduces the full local build of openvino, openvino_tokenizers,
-# and openvino.genai wheels — all installed into a single venv.
+# Fresh-environment build of openvino, openvino_tokenizers, and openvino.genai
+# wheels, installed into a single venv.
 #
 # Exercised path (Linux x86_64, Ubuntu 24.04, gcc 13, Python 3.11):
 #   OpenVINO   master (pybind11 v3.0.2 submodule), _GLIBCXX_USE_CXX11_ABI=1
-#   Tokenizers thirdparty/openvino_tokenizers pinned to 82c5a767 (+ local TF strip)
+#   Tokenizers thirdparty/openvino_tokenizers, pinned to 66926f84 (local TF strip + SPDX license)
 #   GenAI      this repo, pybind11 v3.0.1 via FetchContent, ABI=1
 #
 # Import smoke: `python -c "import openvino_genai"` succeeds; passing
@@ -24,9 +24,7 @@ python3 -m venv "${VENV}"
 "${VENV}/bin/pip" install numpy py-build-cmake==0.5.0 pybind11-stubgen==2.5.5 cmake==3.23.3
 
 # ---------- OpenVINO ----------
-if [ ! -d "${OV_SRC}" ]; then
-    git clone --recursive https://github.com/openvinotoolkit/openvino.git "${OV_SRC}"
-fi
+git clone --recursive https://github.com/openvinotoolkit/openvino.git "${OV_SRC}"
 
 cmake -S "${OV_SRC}" -B "${OV_SRC}/build_wheel" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -47,15 +45,11 @@ cmake --build "${OV_SRC}/build_wheel" --parallel "${JOBS}" --target wheel
     "${OV_SRC}"/build_wheel/wheels/openvino-*cp311-cp311-*.whl
 
 # ---------- openvino.genai (clone + submodules) ----------
-if [ ! -d "${GENAI_SRC}" ]; then
-    git clone https://github.com/openvinotoolkit/openvino.genai.git "${GENAI_SRC}"
-fi
+git clone --branch claude/reproduce-abi-mismatch \
+    https://github.com/SearchSavior/openvino.genai.git "${GENAI_SRC}"
 git -C "${GENAI_SRC}" submodule update --init --recursive
 
 # ---------- openvino_tokenizers ----------
-# TF frontend is disabled above, so patch ov_extension.cpp to drop the TF
-# dependency. Also switch the license expression to PEP 639 SPDX form so
-# py-build-cmake 0.5.0 accepts the project metadata.
 ( cd "${GENAI_SRC}/thirdparty/openvino_tokenizers"
   OpenVINO_DIR="${VENV}/lib/python3.11/site-packages/openvino/cmake" \
     "${VENV}/bin/pip" wheel . --no-deps --no-build-isolation \
@@ -65,8 +59,6 @@ git -C "${GENAI_SRC}" submodule update --init --recursive
     /tmp/tokenizers_wheel/openvino_tokenizers-*.whl
 
 # ---------- openvino.genai ----------
-# The pyproject already uses the SPDX license form on this branch.
-# pybind11-stubgen must be on PATH for the py_openvino_genai_stub target.
 ( cd "${GENAI_SRC}"
   PATH="${VENV}/bin:${PATH}" \
   OpenVINO_DIR="${VENV}/lib/python3.11/site-packages/openvino/cmake" \
