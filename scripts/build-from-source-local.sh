@@ -46,6 +46,12 @@ cmake --build "${OV_SRC}/build_wheel" --parallel "${JOBS}" --target wheel
 "${VENV}/bin/pip" install --force-reinstall --no-deps \
     "${OV_SRC}"/build_wheel/wheels/openvino-*cp311-cp311-*.whl
 
+# ---------- openvino.genai (clone + submodules) ----------
+if [ ! -d "${GENAI_SRC}" ]; then
+    git clone https://github.com/openvinotoolkit/openvino.genai.git "${GENAI_SRC}"
+fi
+git -C "${GENAI_SRC}" submodule update --init --recursive
+
 # ---------- openvino_tokenizers ----------
 # TF frontend is disabled above, so patch ov_extension.cpp to drop the TF
 # dependency. Also switch the license expression to PEP 639 SPDX form so
