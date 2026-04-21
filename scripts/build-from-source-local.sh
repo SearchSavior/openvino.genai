@@ -4,7 +4,8 @@
 #
 # Exercised path (Linux x86_64, Ubuntu 24.04, gcc 13, Python 3.11):
 #   OpenVINO   master (pybind11 v3.0.2 submodule), _GLIBCXX_USE_CXX11_ABI=1
-#   Tokenizers thirdparty/openvino_tokenizers, pinned to 66926f84 (local TF strip + SPDX license)
+#   Tokenizers thirdparty/openvino_tokenizers at upstream, SPDX metadata
+#              normalized inline for py-build-cmake 0.5.0 (PEP 639)
 #   GenAI      this repo, pybind11 v3.0.1 via FetchContent, ABI=1
 #
 # Import smoke: `python -c "import openvino_genai"` succeeds; passing
@@ -29,13 +30,6 @@ git clone --recursive https://github.com/openvinotoolkit/openvino.git "${OV_SRC}
 cmake -S "${OV_SRC}" -B "${OV_SRC}/build_wheel" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_PYTHON=ON -DENABLE_WHEEL=ON \
-    -DENABLE_SAMPLES=OFF -DENABLE_TESTS=OFF \
-    -DENABLE_OV_IR_FRONTEND=ON -DENABLE_OV_PYTORCH_FRONTEND=ON \
-    -DENABLE_OV_TF_FRONTEND=OFF -DENABLE_OV_TF_LITE_FRONTEND=OFF \
-    -DENABLE_OV_ONNX_FRONTEND=OFF -DENABLE_OV_PADDLE_FRONTEND=OFF \
-    -DENABLE_OV_JAX_FRONTEND=OFF \
-    -DENABLE_INTEL_GPU=OFF -DENABLE_INTEL_NPU=OFF \
-    -DENABLE_SYSTEM_TBB=ON -DENABLE_SYSTEM_PUGIXML=ON \
     -DCI_BUILD_NUMBER=2026.0.0-1-localbuild \
     -DPython3_EXECUTABLE="${VENV}/bin/python"
 
@@ -50,6 +44,14 @@ git clone --branch claude/reproduce-abi-mismatch \
 git -C "${GENAI_SRC}" submodule update --init --recursive
 
 # ---------- openvino_tokenizers ----------
+# py-build-cmake 0.5.0 rejects the legacy license-table form + OSI classifier
+# under PEP 639. Upstream pyproject.toml still uses the old form; rewrite
+# in place to the SPDX expression before building.
+sed -i \
+    -e 's|^license = { "text" = "Apache-2.0" }$|license = "Apache-2.0"|' \
+    -e '/^    "License :: OSI Approved :: Apache Software License",$/d' \
+    "${GENAI_SRC}/thirdparty/openvino_tokenizers/pyproject.toml"
+
 ( cd "${GENAI_SRC}/thirdparty/openvino_tokenizers"
   OpenVINO_DIR="${VENV}/lib/python3.11/site-packages/openvino/cmake" \
     "${VENV}/bin/pip" wheel . --no-deps --no-build-isolation \
