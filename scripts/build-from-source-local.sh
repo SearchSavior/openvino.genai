@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 # Fresh-environment build of openvino, openvino_tokenizers, and openvino.genai
 # wheels, installed into a single venv.
-#
-# Exercised path (Linux x86_64, Ubuntu 24.04, gcc 13, Python 3.11):
-#   OpenVINO   master (pybind11 v3.0.2 submodule), _GLIBCXX_USE_CXX11_ABI=1
-#   Tokenizers thirdparty/openvino_tokenizers at upstream, SPDX metadata
-#              normalized inline for py-build-cmake 0.5.0 (PEP 639)
-#   GenAI      this repo, pybind11 v3.0.1 via FetchContent, ABI=1
-#
-# Import smoke: `python -c "import openvino_genai"` succeeds; passing
-# `ov.Tensor` through `openvino_genai.TokenizedInputs` round-trips.
 set -euo pipefail
 
 : "${WORKSPACE:=$HOME}"
@@ -39,19 +30,10 @@ cmake --build "${OV_SRC}/build_wheel" --parallel "${JOBS}" --target wheel
     "${OV_SRC}"/build_wheel/wheels/openvino-*cp311-cp311-*.whl
 
 # ---------- openvino.genai (clone + submodules) ----------
-git clone --branch claude/reproduce-abi-mismatch \
-    https://github.com/SearchSavior/openvino.genai.git "${GENAI_SRC}"
+git clone https://github.com/SearchSavior/openvino.genai.git "${GENAI_SRC}"
 git -C "${GENAI_SRC}" submodule update --init --recursive
 
 # ---------- openvino_tokenizers ----------
-# py-build-cmake 0.5.0 rejects the legacy license-table form + OSI classifier
-# under PEP 639. Upstream pyproject.toml still uses the old form; rewrite
-# in place to the SPDX expression before building.
-sed -i \
-    -e 's|^license = { "text" = "Apache-2.0" }$|license = "Apache-2.0"|' \
-    -e '/^    "License :: OSI Approved :: Apache Software License",$/d' \
-    "${GENAI_SRC}/thirdparty/openvino_tokenizers/pyproject.toml"
-
 ( cd "${GENAI_SRC}/thirdparty/openvino_tokenizers"
   OpenVINO_DIR="${VENV}/lib/python3.11/site-packages/openvino/cmake" \
     "${VENV}/bin/pip" wheel . --no-deps --no-build-isolation \
