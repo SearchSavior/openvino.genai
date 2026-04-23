@@ -118,6 +118,88 @@ rm -rf /mnt/Ironwolf-4TB/openvino-hetero-test/openvino.genai/.py-build-cmake_cac
 rm -rf /tmp/genai_wheel
 ```
 
+### 9a. Patch the `gguf_utils/format` template (required on gcc 13)
+
+Before building, apply a two-file patch to fix an upstream template-linkage
+bug that only manifests on gcc 13. On gcc 11 (Ubuntu 22.04 CI) and gcc 14
+with `-fno-lto` (manylinux_2_28 CI) the bug doesn't trigger, which is why
+it survives in master.
+
+**The bug.** `src/cpp/src/gguf_utils/gguf.hpp` declares a variadic template
+`format` at global scope, and `gguf.cpp` provides the definition *in the
+.cpp file*. Any other TU that includes `gguf.hpp` (e.g. `building_blocks.cpp`)
+sees only the declaration, so the compiler emits an external reference to
+`format<int>`. gcc 13 at `-O3 -fvisibility-inlines-hidden` then ISRA-clones
+the `gguf.cpp`-local instantiations into a local-only specialization
+(`format<int>.isra.0`) and drops the normal external symbol entirely, so
+`building_blocks.o`'s reference has nothing to resolve against. The linker
+permits it (shared libs default to allowing unresolved symbols), and `dlopen`
+fails at wheel-build stub-generation time with:
+
+```
+ImportError: .../libopenvino_genai.so.2620:
+  undefined symbol: _Z6formatIJiEENSt7__cxx1112basic_stringI...
+```
+
+**The fix.** Move the template body from `gguf.cpp` into `gguf.hpp` and mark
+it `inline`. Every TU that includes the header then sees the full definition
+and can instantiate it locally — no cross-TU symbol dependency is possible.
+
+**Edit 1: `src/cpp/src/gguf_utils/gguf.hpp`, lines 30-31.** Replace this
+declaration:
+
+```cpp
+template <typename... Args>
+std::string format(std::string fmt, Args... args);
+```
+
+with this inline definition:
+
+```cpp
+template <typename... Args>
+inline std::string format(std::string fmt, Args... args) {
+    size_t bufferSize = 1000;
+    char* buffer = new char[bufferSize];
+    int n = sprintf(buffer, fmt.c_str(), args...);
+    assert(n >= 0 && n < (int)bufferSize - 1);
+    std::string fmtStr(buffer);
+    delete[] buffer;
+    return fmtStr;
+}
+```
+
+**Edit 2: `src/cpp/src/gguf_utils/gguf.cpp`, lines 16-27.** Delete the
+duplicate definition (which is now in the header). The deleted block is:
+
+```cpp
+template <typename... Args>
+std::string format(std::string fmt, Args... args) {
+    size_t bufferSize = 1000;
+    char* buffer = new char[bufferSize];
+    int n = sprintf(buffer, fmt.c_str(), args...);
+    assert(n >= 0 && n < (int)bufferSize - 1);
+
+    std::string fmtStr(buffer);
+    delete[] buffer;
+    return fmtStr;
+}
+
+```
+
+Leave the `#include "gguf_utils/gguf.hpp"` at the top of the file — it
+now pulls the definition in.
+
+**Verify the patch shape** before building:
+
+```sh
+cd /mnt/Ironwolf-4TB/openvino-hetero-test/openvino.genai
+git diff --stat src/cpp/src/gguf_utils/
+# expect: gguf.cpp | 12 ------------
+#         gguf.hpp |  9 ++++++++-
+```
+
+### 9b. Build the wheel
+
 Build. On a 16 GB box, **do not use `$(nproc)`** for this step — the genai
 object library compiles about a dozen whisper + LLM transformation TUs that
 each eat >1 GB at link time and the build OOMs. Cap parallelism at 2:
@@ -172,24 +254,52 @@ Run against `/home/user/` (a 4-core / 15 GB sandbox, not `/mnt/Ironwolf-4TB/`):
 | 6 — cmake --build --target ie_wheel | OK (~50 min, wheel lands) |
 | 7 — install OV wheel | OK (`openvino==2026.2.0`) |
 | 8 — tokenizers wheel (py-build-cmake 0.4.3, cache wiped) | OK (`openvino-tokenizers==2026.2.0.0`) |
-| 9 — genai wheel (py-build-cmake 0.5.0, `CMAKE_BUILD_PARALLEL_LEVEL=2`) | **In progress** — last heartbeat at `[86%]`, 12 GB / 16 GB RSS, compiling `src/whisper/transformations/scaled_dot_product_attention_decomposition.cpp`. Earlier attempts at default parallelism `$(nproc)=4` silently SIGKILL'd at the metadata-prep stage with no log output — almost certainly OOM during concurrent cc1plus invocations. |
-| 10 — version prints | not yet reached |
-| smoke test | not yet reached |
+| 9a — apply gguf `format` template patch | Required on gcc 13; fixes dlopen-time undefined symbol. |
+| 9b — genai wheel (py-build-cmake 0.5.0, `CMAKE_BUILD_PARALLEL_LEVEL=2`) | OK after patch (`openvino-genai==2026.2.0.0`). At default parallelism `$(nproc)=4` the build silently SIGKILLs at metadata-prep with no log output — OOM during concurrent cc1plus invocations. |
+| 10 — version prints | OK |
+| smoke test | OK |
 
-## What to try next if genai OOMs again
+## What to try if things break
 
-1. Drop parallelism further: `CMAKE_BUILD_PARALLEL_LEVEL=1`. Builds serially,
-   takes ~3× longer but will fit in any box that can build OpenVINO itself.
+### `undefined symbol: _Z6formatIJiE...__cxx11...basic_string...`
+
+Not an ABI mismatch (even though the mangled name contains `__cxx11`). It's
+the template-linkage bug covered in step 9a. Apply the patch, wipe
+`.py-build-cmake_cache/`, rebuild. Quick verification from your built .so:
+
+```sh
+nm /path/to/openvino.genai/.py-build-cmake_cache/cp312-cp312-linux_x86_64/openvino_genai/libopenvino_genai.so.2620 \
+  | c++filt | grep ' format<'
+```
+
+Before the patch you will see both a `U format<int>(...)` (undefined) and a
+`t format<int>(...) [clone .isra.0]` (TU-local ISRA clone). After the patch,
+`format<int>` becomes a `W` weak symbol — linker can resolve cross-TU refs.
+
+### genai build OOMs even with `CMAKE_BUILD_PARALLEL_LEVEL=2`
+
+1. Drop to `CMAKE_BUILD_PARALLEL_LEVEL=1`. Builds serially, ~3× slower but
+   will fit in any box that can build OpenVINO itself.
 2. Add swap: `sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
-   The genai link phase spikes briefly — swap absorbs it without slowing steady-state compile.
-3. Build with `-g0 -O2` instead of the default `-O3 -g` to shrink TUs:
-   `CMAKE_ARGS="-DCMAKE_CXX_FLAGS=-O2 -DCMAKE_BUILD_TYPE=Release" pip wheel ...`
-4. If you hit the `ImportError: libopenvino_genai.so.2620: undefined symbol:
-   _Z6format...__cxx11...basic_string...` after a successful build, that's the
-   `_GLIBCXX_USE_CXX11_ABI` mismatch — your loaded libopenvino was built with
-   ABI=0 and genai with ABI=1 (or vice versa). Fix: build both from source in
-   the same venv (this doc), or rebuild genai with
-   `-D_GLIBCXX_USE_CXX11_ABI=0` to match a PyPI manylinux_2_28- wheel.
+   The link phase spikes briefly — swap absorbs it without slowing
+   steady-state compile.
+3. Build at `-O2 -g0` instead of the default `-O3 -g` to shrink TUs:
+   `CMAKE_ARGS="-DCMAKE_CXX_FLAGS=-O2 -DCMAKE_BUILD_TYPE=Release" pip wheel ...`.
+
+### Real `_GLIBCXX_USE_CXX11_ABI` mismatch (if you ever get one)
+
+Rare in this workflow because you're building OV and genai in the same
+venv with the same compiler. If you see it, usually it's because some
+other pip install pulled in the PyPI manylinux_2_28 OV wheel (ABI=0) on
+top of your source-built wheel (ABI=1). Check with:
+
+```sh
+nm -D /path/to/.venv/lib/python3.12/site-packages/openvino/libs/libopenvino.so.2620 \
+  | grep -c __cxx11
+```
+
+`0` → PyPI ABI=0 wheel snuck in. `~800` → source build, ABI=1 (what you want).
+Fix: re-`pip install --force-reinstall --no-deps /path/to/your/source/wheel`.
 
 ## Notes
 
