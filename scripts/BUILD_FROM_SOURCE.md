@@ -39,12 +39,24 @@ openvino_tokenizers and openvino_genai need different versions.
 
 ## 5. Configure OpenVINO with CMake
 
+`_GLIBCXX_USE_CXX11_ABI=0` must be set explicitly. OpenVINO's cmake sets it
+internally for its own TUs, but does not export it as a cmake `INTERFACE`
+property on its targets. Any downstream project (GenAI, tokenizers) that
+does not set it independently will compile with the system default (`=1` on
+GCC 5+), producing an ABI mismatch at every function boundary that involves
+`std::string` — not just code that touches `ov::Tensor`. The symptom is
+`TypeError: incompatible function arguments` or silent wrong-result behaviour
+on any GenAI API call, regardless of whether your code explicitly uses
+`ov::Tensor`.
+
 ```sh
 cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_PYTHON=ON \
   -DENABLE_WHEEL=ON \
   -DPython3_EXECUTABLE=$(which python3) \
+  -DCMAKE_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=0" \
+  -DCMAKE_C_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=0" \
   -S /mnt/Ironwolf-4TB/openvino-hetero-test/openvino \
   -B /mnt/Ironwolf-4TB/openvino-hetero-test/openvino/build
 ```
@@ -209,6 +221,7 @@ cd /mnt/Ironwolf-4TB/openvino-hetero-test/openvino.genai
 OpenVINO_DIR=/mnt/Ironwolf-4TB/openvino-hetero-test/.venv/lib/python3.12/site-packages/openvino/cmake \
 CMAKE_BUILD_PARALLEL_LEVEL=2 \
   pip wheel . --no-deps --no-build-isolation \
+  --config-settings=cmake.args="-DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=0;-DCMAKE_C_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=0" \
   --wheel-dir /tmp/genai_wheel
 cd /mnt/Ironwolf-4TB/openvino-hetero-test
 
@@ -286,20 +299,30 @@ Before the patch you will see both a `U format<int>(...)` (undefined) and a
 3. Build at `-O2 -g0` instead of the default `-O3 -g` to shrink TUs:
    `CMAKE_ARGS="-DCMAKE_CXX_FLAGS=-O2 -DCMAKE_BUILD_TYPE=Release" pip wheel ...`.
 
-### Real `_GLIBCXX_USE_CXX11_ABI` mismatch (if you ever get one)
+### `_GLIBCXX_USE_CXX11_ABI` mismatch
 
-Rare in this workflow because you're building OV and genai in the same
-venv with the same compiler. If you see it, usually it's because some
-other pip install pulled in the PyPI manylinux_2_28 OV wheel (ABI=0) on
-top of your source-built wheel (ABI=1). Check with:
+This happens whenever OpenVINO and GenAI are compiled with different values of
+`_GLIBCXX_USE_CXX11_ABI`. It is **not** limited to code that uses `ov::Tensor`
+— any call crossing the boundary that involves `std::string` will silently
+produce wrong results or raise `TypeError: incompatible function arguments`.
+
+OpenVINO's cmake sets `_GLIBCXX_USE_CXX11_ABI=0` internally but does not
+propagate it to downstream cmake projects via exported targets. GenAI's cmake
+has no setting for it at all. If you do not pass it explicitly to both builds
+(as shown in steps 5 and 9b above), the mismatch will occur even when building
+both from source with the same compiler.
+
+To confirm which ABI your installed `libopenvino.so` was compiled with:
 
 ```sh
 nm -D /path/to/.venv/lib/python3.12/site-packages/openvino/libs/libopenvino.so.2620 \
   | grep -c __cxx11
 ```
 
-`0` → PyPI ABI=0 wheel snuck in. `~800` → source build, ABI=1 (what you want).
-Fix: re-`pip install --force-reinstall --no-deps /path/to/your/source/wheel`.
+`0` → ABI=0 (old). `~800` → ABI=1 (new). Both OV and GenAI must match.
+
+Fix: rebuild both with the `-D_GLIBCXX_USE_CXX11_ABI=0` flags as shown in
+steps 5 and 9b, wipe `.py-build-cmake_cache/`, and reinstall.
 
 ## Notes
 
