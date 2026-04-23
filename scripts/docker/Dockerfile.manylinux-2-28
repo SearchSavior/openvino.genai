@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+
+# Mirrors openvinogithubactions.azurecr.io/ov_build/manylinux_2_28 — the
+# container used for PyPI manylinux_2_28 wheel builds.
+# Uses the public manylinux_2_28 base (gcc 14 via devtoolset-14,
+# Python 3.9-3.13 under /opt/python/, auditwheel, patchelf).
+
+FROM quay.io/pypa/manylinux_2_28_x86_64
+
+# patchelf is already present. Add sudo + ninja (not in base).
+RUN dnf install -y --allowerasing sudo ninja-build \
+ && dnf clean all
+
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# CI exports these to work around gcc-14 LTO bugs 107532 / 113485. Set them
+# as ENV so they default on for every pip wheel / cmake invocation.
+ENV CXXFLAGS="-Wno-dangling-reference -fno-lto" \
+    CFLAGS="-Wno-dangling-reference -fno-lto" \
+    LDFLAGS="-fno-lto"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
