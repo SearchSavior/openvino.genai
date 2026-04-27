@@ -6,16 +6,19 @@ Workflow:
 2. Build input tensors manually from a tokenized prompt.
 3. Run first-token (no past KV) then subsequent tokens with KV cache.
 4. Compare logits against PyTorch (CPU, seed 0) on the same prompt.
+5. Benchmark model load time, compile time, prefill and decode throughput.
 
 Usage:
   python3 qwen3_ov_pipeline.py --model_dir /home/user/qwen3_int8 \
                                 --model_id Qwen/Qwen3-0.6B \
-                                --prompt "Hello, my name is"
+                                --prompt "Hello, my name is" \
+                                --bench_iters 20
 
-The script also prints the logit comparison table.
+The script prints the logit comparison table and a benchmark summary.
 """
 
 import argparse
+import time
 import numpy as np
 import openvino as ov
 from pathlib import Path
@@ -198,6 +201,118 @@ def greedy_decode(
 
 
 # ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+
+def benchmark_prefill(
+    compiled: ov.CompiledModel,
+    model: ov.Model,
+    input_ids: np.ndarray,
+    iters: int = 10,
+) -> dict:
+    """
+    Time the prefill (first forward pass) over `iters` runs.
+    Each run creates a fresh InferRequest so state is reset.
+    Returns latency stats (ms) and throughput (tokens/s).
+    """
+    batch, prompt_len = input_ids.shape
+    attn_mask = np.ones((batch, prompt_len), dtype=np.int64)
+    pos_ids = np.arange(prompt_len, dtype=np.int64)[None, :]
+    kv_cache = build_kv_cache(model, batch)
+
+    # warm-up
+    req = compiled.create_infer_request()
+    run_step(req, model, input_ids, attn_mask, pos_ids, kv_cache)
+
+    latencies_ms = []
+    for _ in range(iters):
+        req = compiled.create_infer_request()  # reset state each run
+        t0 = time.perf_counter()
+        run_step(req, model, input_ids, attn_mask, pos_ids, kv_cache)
+        latencies_ms.append((time.perf_counter() - t0) * 1000)
+
+    arr = np.array(latencies_ms)
+    mean_ms = float(arr.mean())
+    return {
+        "prompt_tokens": prompt_len,
+        "iters": iters,
+        "mean_ms": mean_ms,
+        "p50_ms": float(np.percentile(arr, 50)),
+        "p95_ms": float(np.percentile(arr, 95)),
+        "throughput_tok_s": prompt_len / (mean_ms / 1000),
+    }
+
+
+def benchmark_decode(
+    compiled: ov.CompiledModel,
+    model: ov.Model,
+    input_ids: np.ndarray,
+    iters: int = 50,
+) -> dict:
+    """
+    Time individual decode steps (single-token forward passes with populated KV).
+    Runs one prefill to fill the cache, then times `iters` decode steps.
+    Reports per-token latency and throughput.
+    """
+    batch, prompt_len = input_ids.shape
+    attn_mask = np.ones((batch, prompt_len), dtype=np.int64)
+    pos_ids = np.arange(prompt_len, dtype=np.int64)[None, :]
+    kv_cache = build_kv_cache(model, batch)
+
+    req = compiled.create_infer_request()
+
+    # prefill to populate KV state
+    logits, kv_cache = run_step(req, model, input_ids, attn_mask, pos_ids, kv_cache)
+    next_token = int(np.argmax(logits[0, -1]))
+
+    # warm-up decode step
+    past_len = prompt_len
+    cur_ids = np.array([[next_token]], dtype=np.int64)
+    cur_mask = np.ones((batch, past_len + 1), dtype=np.int64)
+    cur_pos = np.array([[past_len]], dtype=np.int64)
+    logits, kv_cache = run_step(req, model, cur_ids, cur_mask, cur_pos, kv_cache)
+    next_token = int(np.argmax(logits[0, -1]))
+    past_len += 1
+
+    latencies_ms = []
+    for _ in range(iters):
+        cur_ids = np.array([[next_token]], dtype=np.int64)
+        cur_mask = np.ones((batch, past_len + 1), dtype=np.int64)
+        cur_pos = np.array([[past_len]], dtype=np.int64)
+
+        t0 = time.perf_counter()
+        logits, kv_cache = run_step(req, model, cur_ids, cur_mask, cur_pos, kv_cache)
+        latencies_ms.append((time.perf_counter() - t0) * 1000)
+
+        next_token = int(np.argmax(logits[0, -1]))
+        past_len += 1
+
+    arr = np.array(latencies_ms)
+    mean_ms = float(arr.mean())
+    return {
+        "context_tokens": past_len,
+        "iters": iters,
+        "mean_ms": mean_ms,
+        "p50_ms": float(np.percentile(arr, 50)),
+        "p95_ms": float(np.percentile(arr, 95)),
+        "throughput_tok_s": 1000 / mean_ms,
+    }
+
+
+def print_benchmark(label: str, stats: dict):
+    print(f"\n=== BENCHMARK: {label} ===")
+    if "prompt_tokens" in stats:
+        print(f"  Prompt tokens : {stats['prompt_tokens']}")
+    if "context_tokens" in stats:
+        print(f"  Context tokens: {stats['context_tokens']}")
+    print(f"  Iterations    : {stats['iters']}")
+    print(f"  Mean latency  : {stats['mean_ms']:.2f} ms")
+    print(f"  p50  latency  : {stats['p50_ms']:.2f} ms")
+    print(f"  p95  latency  : {stats['p95_ms']:.2f} ms")
+    print(f"  Throughput    : {stats['throughput_tok_s']:.1f} tok/s")
+
+
+# ---------------------------------------------------------------------------
 # PyTorch reference
 # ---------------------------------------------------------------------------
 
@@ -254,6 +369,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip_pytorch", action="store_true",
                         help="Skip PT reference (faster, no comparison)")
+    parser.add_argument("--bench_iters", type=int, default=20,
+                        help="Iterations for prefill/decode benchmark (0 = skip)")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -261,22 +378,30 @@ def main():
     model_dir = Path(args.model_dir)
     xml_path = model_dir / "openvino_model.xml"
     if not xml_path.exists():
-        # optimum sometimes exports with a different name
         candidates = list(model_dir.glob("*.xml"))
         if not candidates:
             raise FileNotFoundError(f"No .xml found in {model_dir}")
         xml_path = candidates[0]
-    print(f"Loading OV model: {xml_path}")
 
+    # --- Load ---
     core = ov.Core()
+    t0 = time.perf_counter()
     model = core.read_model(str(xml_path))
+    load_ms = (time.perf_counter() - t0) * 1000
+    print(f"Loaded  {xml_path.name}  in {load_ms:.0f} ms")
 
     # --- Inspect graph ---
     inspect_model(model)
 
     # --- Compile ---
+    t0 = time.perf_counter()
     compiled = core.compile_model(model, "CPU")
-    print("Model compiled on CPU.")
+    compile_ms = (time.perf_counter() - t0) * 1000
+    print(f"Compiled on CPU in {compile_ms:.0f} ms")
+
+    print(f"\n=== TIMING SUMMARY ===")
+    print(f"  Load time   : {load_ms:.0f} ms")
+    print(f"  Compile time: {compile_ms:.0f} ms")
 
     # --- Tokenize ---
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
@@ -292,6 +417,14 @@ def main():
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     print(f"Generated tokens: {generated_ids}")
     print(f"Generated text:   {generated_text!r}")
+
+    # --- Benchmarks ---
+    if args.bench_iters > 0:
+        prefill_stats = benchmark_prefill(compiled, model, input_ids, iters=args.bench_iters)
+        print_benchmark("PREFILL", prefill_stats)
+
+        decode_stats = benchmark_decode(compiled, model, input_ids, iters=args.bench_iters)
+        print_benchmark("DECODE (per-token)", decode_stats)
 
     # --- PyTorch reference ---
     if not args.skip_pytorch:
