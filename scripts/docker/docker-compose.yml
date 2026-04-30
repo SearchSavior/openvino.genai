@@ -1,0 +1,34 @@
+# Mirrors the two containers the openvino.genai CI uses. Pick the service
+# whose compiler profile matches what you're targeting:
+#
+#   ubuntu-22-04    -> matches linux.yml nightly genai-wheel build (gcc 11).
+#                      Fastest path to a wheel that imports cleanly.
+#   manylinux-2-28  -> matches manylinux_2_28.yml PyPI wheel build
+#                      (gcc 14 + -fno-lto). Use to reproduce the exact
+#                      artifacts published to PyPI.
+#
+# Both mount the repo root at /workspace/openvino.genai (read/write).
+# `docker compose run --rm <service>` drops you into an interactive shell.
+
+services:
+  ubuntu-22-04:
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu-22-04
+    image: openvino-genai-build:ubuntu-22-04
+    volumes:
+      - ../../:/workspace/openvino.genai
+    working_dir: /workspace/openvino.genai
+    stdin_open: true
+    tty: true
+
+  manylinux-2-28:
+    build:
+      context: .
+      dockerfile: Dockerfile.manylinux-2-28
+    image: openvino-genai-build:manylinux-2-28
+    volumes:
+      - ../../:/workspace/openvino.genai
+    working_dir: /workspace/openvino.genai
+    stdin_open: true
+    tty: true
