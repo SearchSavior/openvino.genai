@@ -81,9 +81,8 @@ std::pair<ov::Tensor, std::optional<int64_t>> InputsEmbedderQwen3_5::get_generat
     int64_t* dst = position_ids.data<int64_t>();
     const int64_t* src = vision_position_ids.data<const int64_t>();
 
-    // Add text position ids to dim 0
-    const int64_t text_position_id = static_cast<int64_t>(history_size);
-    std::fill_n(dst, inputs_embeds_size, text_position_id);
+    // Add text position ids to dim 0 (sequential, not all-same, for multi-token prefill correctness)
+    std::iota(dst, dst + inputs_embeds_size, static_cast<int64_t>(history_size));
 
     // Append 3D vision position ids
     std::memcpy(dst + inputs_embeds_size, src, 3 * inputs_embeds_size * sizeof(int64_t));
