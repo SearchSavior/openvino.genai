@@ -573,10 +573,7 @@ step() is running:
   - add_request(...)
   - has_non_finished_requests()
   - get_metrics()
-  - GenerationHandle.cancel() / GenerationHandle.stop()
-
-Other mutating methods (start_chat / finish_chat) are NOT safe to call
-concurrently with step().)")
+  - GenerationHandle.cancel() / GenerationHandle.stop())")
         .def("has_non_finished_requests", &ContinuousBatchingPipeline::has_non_finished_requests)
 
         .def("start_chat", &ContinuousBatchingPipeline::start_chat, py::arg("system_message") = "")
