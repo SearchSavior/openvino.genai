@@ -131,10 +131,15 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::~ContinuousBatchingImpl() {
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::generate_candidates_for_prompt_lookup() {}
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::_pull_awaiting_requests() {
-    std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
-    m_requests.insert(m_requests.end(), m_awaiting_requests.begin(), m_awaiting_requests.end());
-    m_awaiting_requests.clear();
-    m_pipeline_metrics.requests = m_requests.size();
+    size_t request_count;
+    {
+        std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
+        m_requests.insert(m_requests.end(), m_awaiting_requests.begin(), m_awaiting_requests.end());
+        m_awaiting_requests.clear();
+        request_count = m_requests.size();
+    }
+    std::lock_guard<std::mutex> metrics_lock{m_metrics_mutex};
+    m_pipeline_metrics.requests = request_count;
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
@@ -362,12 +367,15 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         scheduler_output = m_scheduler->schedule(m_requests);
         scheduling_timer.end();
 
-        m_pipeline_metrics.cache_size_in_bytes = scheduler_output.m_cache_size_in_bytes;
-        m_pipeline_metrics.scheduled_requests = scheduler_output.m_scheduled_sequence_groups_ids.size();
-        m_pipeline_metrics.cache_usage = scheduler_output.m_cache_usage;
-        m_pipeline_metrics.max_cache_usage = std::max(m_pipeline_metrics.max_cache_usage, scheduler_output.m_cache_usage);
         _register_step_cache_usage(scheduler_output.m_cache_usage);
-        m_pipeline_metrics.avg_cache_usage = _get_current_running_average_cache_usage();
+        {
+            std::lock_guard<std::mutex> metrics_lock{m_metrics_mutex};
+            m_pipeline_metrics.cache_size_in_bytes = scheduler_output.m_cache_size_in_bytes;
+            m_pipeline_metrics.scheduled_requests = scheduler_output.m_scheduled_sequence_groups_ids.size();
+            m_pipeline_metrics.cache_usage = scheduler_output.m_cache_usage;
+            m_pipeline_metrics.max_cache_usage = std::max(m_pipeline_metrics.max_cache_usage, scheduler_output.m_cache_usage);
+            m_pipeline_metrics.avg_cache_usage = _get_current_running_average_cache_usage();
+        }
 
         const auto& sched_config = m_scheduler->get_config();
         if (sched_config.use_cache_eviction) {
@@ -400,7 +408,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         timer.start();
         logits = m_model_runner->forward(m_requests, scheduler_output);
         const auto infer_end = std::chrono::steady_clock::now();
-        m_pipeline_metrics.inference_duration = PerfMetrics::get_microsec(infer_end - infer_start);
+        {
+            std::lock_guard<std::mutex> metrics_lock{m_metrics_mutex};
+            m_pipeline_metrics.inference_duration = PerfMetrics::get_microsec(infer_end - infer_start);
+        }
         timer.end();
     }
 
@@ -690,6 +701,7 @@ float ContinuousBatchingPipeline::ContinuousBatchingImpl::_get_current_running_a
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::_reset_cache_usage_statistics() {
     m_previous_step_cache_usages.clear();
+    std::lock_guard<std::mutex> metrics_lock{m_metrics_mutex};
     m_pipeline_metrics.max_cache_usage = 0.0;
     m_pipeline_metrics.avg_cache_usage = 0.0;
     m_pipeline_metrics.cache_size_in_bytes = 0;

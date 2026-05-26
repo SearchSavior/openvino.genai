@@ -33,6 +33,9 @@ protected:
     GenerationConfig m_generation_config;
 
     PipelineMetrics m_pipeline_metrics;
+    // Protects m_pipeline_metrics so get_metrics() can be safely called from a different
+    // thread than the one driving step() / generate().
+    mutable std::mutex m_metrics_mutex;
 
     std::string m_device;
 

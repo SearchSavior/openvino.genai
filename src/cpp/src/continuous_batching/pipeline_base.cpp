@@ -36,6 +36,7 @@ void ContinuousBatchingPipeline::IContinuousBatchingPipeline::set_config(const G
 }
 
 PipelineMetrics ContinuousBatchingPipeline::IContinuousBatchingPipeline::get_metrics() const {
+    std::lock_guard<std::mutex> lock{m_metrics_mutex};
     return m_pipeline_metrics;
 }
 
