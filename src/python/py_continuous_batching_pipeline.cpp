@@ -566,14 +566,7 @@ void init_continuous_batching_pipeline(py::module_& m) {
             &ContinuousBatchingPipeline::step,
             py::call_guard<py::gil_scoped_release>(),
             R"(Performs a single inference step. Releases the GIL for the duration of
-the step, so other Python threads can run while inference is in flight.
-
-It is safe to call the following methods from another Python thread while
-step() is running:
-  - add_request(...)
-  - has_non_finished_requests()
-  - get_metrics()
-  - GenerationHandle.cancel() / GenerationHandle.stop())")
+the step, so other Python threads can run while inference is in flight.)")
         .def("has_non_finished_requests", &ContinuousBatchingPipeline::has_non_finished_requests)
 
         .def("start_chat", &ContinuousBatchingPipeline::start_chat, py::arg("system_message") = "")
