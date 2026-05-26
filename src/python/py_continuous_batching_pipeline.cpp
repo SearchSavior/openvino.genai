@@ -561,7 +561,12 @@ void init_continuous_batching_pipeline(py::module_& m) {
             py::arg("generation_config")
         )
         
-        .def("step", &ContinuousBatchingPipeline::step)
+        .def(
+            "step",
+            &ContinuousBatchingPipeline::step,
+            py::call_guard<py::gil_scoped_release>(),
+            R"(Performs a single inference step. Releases the GIL for the duration of
+the step, so other Python threads can run while inference is in flight.)")
         .def("has_non_finished_requests", &ContinuousBatchingPipeline::has_non_finished_requests)
 
         .def("start_chat", &ContinuousBatchingPipeline::start_chat, py::arg("system_message") = "")
