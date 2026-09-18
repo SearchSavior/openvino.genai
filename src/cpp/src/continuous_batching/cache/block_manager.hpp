@@ -641,6 +641,10 @@ class BlockManager {
     std::map<uint64_t, std::vector<BlocksPerLayer>> m_temporary_block_table;
     std::map<uint64_t, size_t> m_block_table_logical_start;
 
+    // Per-layer sliding window size in tokens; 0 = full attention (no window).
+    // When non-empty, must have exactly m_num_layers entries. Empty = no SWA layers.
+    std::vector<size_t> m_layer_window_sizes;
+
     std::mutex m_cached_blocks_map_mutex;
 public:
     struct PrefixRestorePlan {
@@ -671,17 +675,27 @@ public:
      */
     BlockManager(int num_blocks, bool enable_prefix_caching, size_t block_size, size_t num_layers = 1,
                  size_t fixed_blocks_per_sequence = 0, bool restore_latest_prefix_block_only = false,
-                 size_t max_total_blocks = 0)
+                 size_t max_total_blocks = 0,
+                 std::vector<size_t> layer_window_sizes = {})
         : m_allocator(num_blocks, enable_prefix_caching, num_layers), m_enable_prefix_caching(enable_prefix_caching), m_block_size(block_size),
         m_num_layers(num_layers), m_fixed_blocks_per_sequence(fixed_blocks_per_sequence),
         m_max_total_blocks(max_total_blocks),
-        m_restore_latest_prefix_block_only(restore_latest_prefix_block_only) {
+        m_restore_latest_prefix_block_only(restore_latest_prefix_block_only),
+        m_layer_window_sizes(std::move(layer_window_sizes)) {
         OPENVINO_ASSERT(num_layers != 0, "num_layers must be non-zero");
         OPENVINO_ASSERT(!restore_latest_prefix_block_only || enable_prefix_caching,
                         "Latest prefix block restore requires prefix caching to be enabled");
         OPENVINO_ASSERT(max_total_blocks == 0 || static_cast<size_t>(num_blocks) <= max_total_blocks,
                         "Block pool is constructed with ", num_blocks,
                         " blocks, which already exceeds its own ceiling of ", max_total_blocks, " blocks");
+        if (!m_layer_window_sizes.empty()) {
+            OPENVINO_ASSERT(m_layer_window_sizes.size() == m_num_layers,
+                            "layer_window_sizes size (", m_layer_window_sizes.size(),
+                            ") must match num_layers (", m_num_layers, ")");
+        }
+        OPENVINO_ASSERT(std::all_of(m_layer_window_sizes.begin(), m_layer_window_sizes.end(),
+                                    [](size_t w) { return w == 0; }) || !m_enable_prefix_caching,
+                        "Sliding-window attention is not supported together with prefix caching");
     }
 
     ~BlockManager() {
@@ -1467,7 +1481,6 @@ public:
         }
         return blocks_count;
     }
-
     /**
      * @param seq_group Pointer to a sequence group.
      * @return The number of tokens corresponding to the block deficit for the group (required_blocks * block_size).

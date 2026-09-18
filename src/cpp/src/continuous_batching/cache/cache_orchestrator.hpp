@@ -105,14 +105,15 @@ public:
             CacheType type,
             std::unique_ptr<ICacheManager> cache_mgr,
             std::unique_ptr<BlockManager> block_mgr,
-            bool per_layer_control = false) {
+            bool per_layer_control = false,
+            bool per_layer_block_tables = false) {
         OPENVINO_ASSERT(cache_mgr, "Cache manager must not be null");
         OPENVINO_ASSERT(block_mgr, "Block manager must not be null");
         OPENVINO_ASSERT(m_cache_managers.find(type) == m_cache_managers.end(),
                 "Cache type is already registered");
         const size_t num_layers = block_mgr->get_num_layers();
         OPENVINO_ASSERT(num_layers > 0, "Cache type must register at least one block-table layer");
-        OPENVINO_ASSERT(per_layer_control || num_layers == 1,
+        OPENVINO_ASSERT((per_layer_control || per_layer_block_tables) || num_layers == 1,
             "Cache types without per-layer block-table control must register exactly one shared block-table layer");
         m_cache_managers[type] = std::move(cache_mgr);
         m_block_managers[type] = std::move(block_mgr);
@@ -939,14 +940,23 @@ private:
                            const SchedulerConfig& config) {
         const bool per_layer_control = config.use_cache_eviction;
         const size_t num_block_table_layers = per_layer_control ? kv_manager->get_num_layers() : 1;
+        // Sliding-window layers keep per-layer block tables so they can be managed
+        // independently; full-attention-only models keep the shared single table.
+        const bool has_swa_layers = kv_manager->has_sliding_layers();
+        const size_t effective_table_layers =
+            (per_layer_control || has_swa_layers) ? kv_manager->get_num_layers() : 1;
         auto block_manager = std::make_unique<BlockManager>(
             config.num_kv_blocks,
             config.enable_prefix_caching,
             kv_manager->get_block_size(),
-            num_block_table_layers);
+            effective_table_layers,
+            0,
+            false,
+            0,
+            kv_manager->get_window_sizes());
 
         register_cache_type(CacheType::KV_CACHE, std::move(kv_manager), std::move(block_manager),
-                            per_layer_control);
+                            per_layer_control, has_swa_layers);
     }
 
     /**

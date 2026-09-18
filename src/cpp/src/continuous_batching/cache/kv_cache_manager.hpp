@@ -7,6 +7,7 @@
 #include <list>
 
 #include "openvino/runtime/tensor.hpp"
+#include "openvino/op/constant.hpp"
 #include "continuous_batching/cache/i_cache_manager.hpp"
 #include "utils.hpp"
 namespace ov::genai {
@@ -19,6 +20,12 @@ class KVCacheManager : public ICacheManager {
     std::vector<ov::PartialShape> m_key_shapes, m_value_shapes;
     std::vector<ov::Tensor> m_key_cache, m_value_cache;
     size_t m_num_allocated_kv_blocks = 0, m_block_size_in_bytes = 0;
+    // Per-layer sliding window size in tokens; 0 = full attention.
+    // Populated from the compiled model's PagedAttentionExtension ops (post-conversion,
+    // post-folding the SLIDING_WINDOW input is a scalar Constant per layer).
+    std::vector<size_t> m_window_sizes;
+    // True if at least one layer is sliding-window (model is a gemma4-style hybrid).
+    bool m_has_sliding_layers = false;
     ov::InferRequest m_request;
     ov::RemoteContext m_context;
 
@@ -110,6 +117,69 @@ public:
         m_block_size = all_gpu_device ? ( has_xattention ? gpu_block_size_xattn : gpu_block_size ) : cpu_block_size;
         m_num_layers = m_value_precisions.size();
         OPENVINO_ASSERT(m_num_layers == m_key_precisions.size(), "Invalid case: a different number of K and V caches in a LLM model");
+
+        // Detect per-layer sliding window sizes from the compiled model graph.
+        //
+        // After prepare_model_for_paged_attention (ov::pass::SDPAToPagedAttention) and
+        // the plugin's common constant-folding passes, each PagedAttentionExtension's
+        // SLIDING_WINDOW input (index SLIDING_WINDOW in paged_attention.hpp PaArguments)
+        // is a scalar Constant: window>0 for sliding-window layers, 0 for full attention.
+        // The op order in the converted model matches key_cache.N/value_cache.N numbering
+        // (one PA op per decoder layer, m_layer_index increments per conversion).
+        try {
+            // Runtime model ops are matched by type name (PagedAttentionExtension lives in
+            // the dev API headers; matching by name keeps this header self-contained).
+            std::shared_ptr<const ov::Model> model = compiled_model.get_runtime_model();
+            if (model) {
+                m_window_sizes.assign(m_num_layers, 0);
+                size_t layer_idx = 0;
+                for (const auto& op : model->get_ordered_ops()) {
+                    if (std::string(op->get_type_name()) != "PagedAttentionExtension") {
+                        continue;
+                    }
+                    OPENVINO_ASSERT(layer_idx < m_num_layers,
+                                    "PagedAttentionExtension count exceeds KV cache layer count");
+                    // Note: the runtime model is post-folding, so the SLIDING_WINDOW
+                    // input source is expected to be a Constant here. If it is not
+                    // (unusual graph), leave the layer as full attention and warn.
+                    const auto& sw_input = op->get_input_node_shared_ptr(10);  // SLIDING_WINDOW, see dev_api paged_attention.hpp
+                    if (const auto sw_const = ov::as_type_ptr<ov::op::v0::Constant>(sw_input)) {
+                        if (ov::shape_size(sw_const->get_output_shape(0)) == 1) {
+                            const auto w = sw_const->cast_vector<int64_t>()[0];
+                            if (w > 0) {
+                                m_window_sizes[layer_idx] = static_cast<size_t>(w);
+                                m_has_sliding_layers = true;
+                            }
+                        }
+                    } else if (utils::env_setup_for_print_debug_info()) {
+                        std::cout << "[SWA]: SLIDING_WINDOW input of layer " << layer_idx
+                                  << " is not a Constant in the runtime model; treating as full attention."
+                                  << std::endl;
+                    }
+                    ++layer_idx;
+                }
+                OPENVINO_ASSERT(layer_idx == m_num_layers,
+                                "PagedAttentionExtension count does not match KV cache layer count: ",
+                                layer_idx, " vs ", m_num_layers);
+            }
+        } catch (const ov::Exception&) {
+            // Runtime model inspection is best-effort; absence of PA ops (e.g. models
+            // compiled without the SDPA->PA conversion) means no sliding-window info.
+            m_window_sizes.clear();
+            m_has_sliding_layers = false;
+        }
+    }
+
+    // --- Sliding-window (gemma4-style hybrid) accessors ---
+
+    /// @return Per-layer sliding window size in tokens; 0 = full attention.
+    const std::vector<size_t>& get_window_sizes() const {
+        return m_window_sizes;
+    }
+
+    /// @brief Whether any layer uses sliding-window attention.
+    bool has_sliding_layers() const {
+        return m_has_sliding_layers;
     }
 
     // --- ICacheManager interface ---
